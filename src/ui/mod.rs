@@ -2,7 +2,7 @@
 
 mod panels;
 
-pub use panels::{OverlayState, draw_overlay};
+pub use panels::{FALL_SECONDS_RANGE, OverlayState, draw_overlay};
 
 use winit::window::Window;
 
@@ -16,7 +16,7 @@ pub struct EguiLayer {
 }
 
 impl EguiLayer {
-    /// Creates the egui integration for `window`, rendering to the surface format of `gpu`.
+    /// Creates the egui integration for `window`, rendering to [`Gpu::ui_format`].
     pub fn new(window: &Window, gpu: &Gpu) -> Self {
         let ctx = egui::Context::default();
         ctx.set_theme(egui::Theme::Dark);
@@ -28,7 +28,7 @@ impl EguiLayer {
             window.theme(),
             Some(gpu.device.limits().max_texture_dimension_2d as usize),
         );
-        let renderer = egui_wgpu::Renderer::new(&gpu.device, gpu.config.format, egui_wgpu::RendererOptions::default());
+        let renderer = egui_wgpu::Renderer::new(&gpu.device, gpu.ui_format(), egui_wgpu::RendererOptions::default());
         Self { ctx, state, renderer }
     }
 

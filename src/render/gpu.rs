@@ -20,7 +20,7 @@ pub struct Gpu {
 }
 
 impl Gpu {
-    /// Creates the device and configures a vsynced sRGB surface for `window`.
+    /// Creates the device and configures a vsynced surface for `window`.
     pub fn new(window: Arc<Window>) -> anyhow::Result<Self> {
         let instance = wgpu::Instance::new(wgpu::InstanceDescriptor::new_without_display_handle_from_env());
         let surface = instance.create_surface(window.clone()).context("creating window surface")?;
@@ -43,14 +43,17 @@ impl Gpu {
         .context("creating GPU device")?;
 
         let caps = surface.get_capabilities(&adapter);
-        // Our shaders output linear color; an sRGB swapchain does the encoding for free.
+        // The swapchain itself is non-sRGB because egui expects that; the scene
+        // renders through an sRGB view of it so our linear shader output is encoded for free.
         let format = caps
             .formats
             .iter()
             .copied()
-            .find(wgpu::TextureFormat::is_srgb)
+            .find(|f| f.is_srgb())
             .or_else(|| caps.formats.first().copied())
-            .context("surface reports no supported formats")?;
+            .context("surface reports no supported formats")?
+            .remove_srgb_suffix();
+        log::info!("surface format {format:?}, present modes {:?}", caps.present_modes);
         let alpha_mode = caps.alpha_modes.first().copied().unwrap_or(wgpu::CompositeAlphaMode::Auto);
 
         let size = window.inner_size();
@@ -62,12 +65,22 @@ impl Gpu {
             present_mode: wgpu::PresentMode::AutoVsync,
             desired_maximum_frame_latency: 2,
             alpha_mode,
-            view_formats: vec![],
+            view_formats: vec![format.add_srgb_suffix()],
             color_space: wgpu::SurfaceColorSpace::Auto,
         };
         surface.configure(&device, &config);
 
         Ok(Self { surface, device, queue, config, adapter_info })
+    }
+
+    /// Format for scene passes: the sRGB view of the swapchain (linear shader output).
+    pub fn scene_format(&self) -> wgpu::TextureFormat {
+        self.config.format.add_srgb_suffix()
+    }
+
+    /// Format for egui: the swapchain's own non-sRGB format.
+    pub fn ui_format(&self) -> wgpu::TextureFormat {
+        self.config.format
     }
 
     /// Reconfigures the surface for a new window size. Zero sizes (minimized) are ignored.

@@ -1,10 +1,13 @@
-// Fullscreen dark gradient with a slowly breathing warm haze near the
-// keyboard and a soft vignette. Outputs linear color.
+// Fullscreen dark gradient with a slowly drifting warm haze above the
+// keyboard, faint smoke-like noise and a soft vignette. Outputs linear HDR.
 
 struct Globals {
-    resolution: vec2<f32>,
+    screen: vec2<f32>,
     time: f32,
-    _pad: f32,
+    dt: f32,
+    hit_y: f32,
+    unit: f32,
+    _pad: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -28,23 +31,41 @@ fn hash12(p: vec2<f32>) -> f32 {
     return fract(sin(dot(p, vec2<f32>(12.9898, 78.233))) * 43758.5453);
 }
 
+fn value_noise(p: vec2<f32>) -> f32 {
+    let i = floor(p);
+    let f = fract(p);
+    let u = f * f * (3.0 - 2.0 * f);
+    let a = hash12(i);
+    let b = hash12(i + vec2<f32>(1.0, 0.0));
+    let c = hash12(i + vec2<f32>(0.0, 1.0));
+    let d = hash12(i + vec2<f32>(1.0, 1.0));
+    return mix(mix(a, b, u.x), mix(c, d, u.x), u.y);
+}
+
 @fragment
 fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
-    let top = vec3<f32>(0.0035, 0.0040, 0.0100);
-    let bottom = vec3<f32>(0.0150, 0.0090, 0.0240);
-    var col = mix(top, bottom, smoothstep(0.0, 1.0, in.uv.y));
+    let aspect = globals.screen.x / max(globals.screen.y, 1.0);
+    let hit_v = globals.hit_y / max(globals.screen.y, 1.0);
 
-    let aspect = globals.resolution.x / max(globals.resolution.y, 1.0);
-    let p = vec2<f32>((in.uv.x - 0.5) * aspect * 0.6, in.uv.y - 1.0);
-    let breathe = 0.5 + 0.5 * sin(globals.time * 0.4);
-    let haze = exp(-dot(p, p) * 4.0) * (0.020 + 0.008 * breathe);
-    col += vec3<f32>(1.0, 0.42, 0.12) * haze;
+    let top = vec3<f32>(0.0030, 0.0035, 0.0090);
+    let bottom = vec3<f32>(0.0140, 0.0080, 0.0200);
+    var col = mix(top, bottom, smoothstep(0.0, hit_v, in.uv.y));
+
+    // Smoke: two octaves of slowly rising value noise, strongest near the keys.
+    let t = globals.time;
+    let p = vec2<f32>(in.uv.x * aspect, in.uv.y) * 3.0;
+    let smoke = value_noise(p + vec2<f32>(t * 0.02, t * 0.06)) * 0.65
+        + value_noise(p * 2.3 - vec2<f32>(t * 0.03, t * 0.11)) * 0.35;
+    let near_keys = smoothstep(0.0, hit_v, in.uv.y);
+    col += vec3<f32>(0.012, 0.006, 0.010) * smoke * near_keys;
+
+    // Warm haze just above the hit line, breathing slowly.
+    let h = vec2<f32>((in.uv.x - 0.5) * aspect * 0.55, (in.uv.y - hit_v) * 2.2);
+    let breathe = 0.5 + 0.5 * sin(t * 0.4);
+    col += vec3<f32>(1.0, 0.40, 0.12) * exp(-dot(h, h) * 3.0) * (0.018 + 0.007 * breathe);
 
     let d = (in.uv - 0.5) * vec2<f32>(aspect, 1.0);
-    col *= 1.0 - 0.55 * smoothstep(0.45, 1.25, length(d));
-
-    // Tiny dither to break up 8-bit banding in the dark gradient.
-    col += (hash12(in.pos.xy) - 0.5) * (1.5 / 255.0) * col * 8.0;
+    col *= 1.0 - 0.6 * smoothstep(0.45, 1.3, length(d));
 
     return vec4<f32>(col, 1.0);
 }

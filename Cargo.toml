@@ -10,7 +10,8 @@ anyhow = "1.0.104"
 # Not in the original stack list: zero-copy casting of instance/uniform structs into wgpu buffers.
 bytemuck = { version = "1.25.2", features = ["derive"] }
 cpal = "0.18.2"
-egui = "0.37.0"
+# Fonts are opt-in since egui 0.37; the emoji set covers the ▶ ⏸ 📂 ✕ symbols used in the UI.
+egui = { version = "0.37.0", features = ["monochrome_emoji_fonts"] }
 egui-wgpu = "0.37.0"
 egui-winit = "0.37.0"
 env_logger = "0.11.11"
@@ -34,3 +35,8 @@ opt-level = 2
 
 [profile.release]
 lto = "thin"
+
+[dev-dependencies]
+# Same version wgpu 30 uses internally: lets `cargo test` validate every WGSL shader
+# without a GPU, instead of discovering errors as a panic at startup.
+naga = { version = "30", features = ["wgsl-in"] }
