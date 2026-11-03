@@ -17,6 +17,50 @@ pub struct Config {
     pub window: WindowConfig,
     /// Overlay visibility.
     pub ui: UiConfig,
+    /// Playback preferences.
+    pub playback: PlaybackConfig,
+    /// Audio output.
+    pub audio: AudioConfig,
+    /// Look of the scene.
+    pub visual: VisualConfig,
+}
+
+/// Visual settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct VisualConfig {
+    /// Bloom intensity, 0 = off.
+    pub bloom: f32,
+    /// Particle amount multiplier, 0 = off.
+    pub particles: f32,
+    /// Note corner radius in pixels.
+    pub corner_radius: f32,
+    /// Whether the glowing hit line is drawn.
+    pub show_hit_line: bool,
+}
+
+impl Default for VisualConfig {
+    fn default() -> Self {
+        Self { bloom: 1.0, particles: 1.0, corner_radius: 5.0, show_hit_line: true }
+    }
+}
+
+/// Audio output settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct AudioConfig {
+    /// Last SoundFont, reloaded on startup.
+    pub soundfont: Option<PathBuf>,
+    /// Output volume, 0..=1.
+    pub volume: f32,
+    /// Requested frames per audio callback (lower = less latency, more CPU).
+    pub buffer_frames: u32,
+}
+
+impl Default for AudioConfig {
+    fn default() -> Self {
+        Self { soundfont: None, volume: 0.8, buffer_frames: 256 }
+    }
 }
 
 /// Window geometry restored on startup.
@@ -48,6 +92,22 @@ pub struct UiConfig {
 impl Default for UiConfig {
     fn default() -> Self {
         Self { visible: true, show_fps: false }
+    }
+}
+
+/// Playback preferences.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct PlaybackConfig {
+    /// Playback speed multiplier.
+    pub speed: f64,
+    /// Seconds of music visible above the hit line.
+    pub fall_seconds: f64,
+}
+
+impl Default for PlaybackConfig {
+    fn default() -> Self {
+        Self { speed: 1.0, fall_seconds: 3.0 }
     }
 }
 
@@ -108,6 +168,13 @@ mod tests {
         let cfg = Config {
             window: WindowConfig { width: 1234, height: 567 },
             ui: UiConfig { visible: false, show_fps: true },
+            playback: PlaybackConfig { speed: 0.5, fall_seconds: 4.5 },
+            audio: AudioConfig {
+                soundfont: Some(PathBuf::from("C:/fonts/piano.sf2")),
+                volume: 0.5,
+                buffer_frames: 128,
+            },
+            visual: VisualConfig { bloom: 1.5, particles: 0.5, corner_radius: 2.0, show_hit_line: false },
         };
         cfg.save_to(&path).unwrap();
         let loaded = Config::load_from(&path).unwrap();

@@ -1,2 +1,5 @@
 /target
 config.toml
+*.mid
+*.midi
+*.sf2

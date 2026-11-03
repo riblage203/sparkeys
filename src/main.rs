@@ -16,7 +16,7 @@ fn main() -> anyhow::Result<()> {
     env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("sparkeys=info,warn")).init();
 
     let event_loop = EventLoop::new()?;
-    let mut app = app::App::new();
+    let mut app = app::App::new(std::env::args_os().nth(1).map(Into::into));
     event_loop.run_app(&mut app)?;
 
     match app.into_fatal_error() {
