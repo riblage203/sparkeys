@@ -18,9 +18,11 @@ mod quads;
 mod scene;
 
 pub use gpu::Gpu;
-pub use scene::SceneInput;
+pub use scene::{LiveView, SceneInput};
 
+use crate::config::PaletteKind;
 use background::Background;
+
 use bloom::PostFx;
 use globals::{Globals, GlobalsBuffer};
 use layout::KeyboardLayout;
@@ -42,6 +44,7 @@ pub struct Renderer {
     scene: SceneState,
     layout: KeyboardLayout,
     palette: Palette,
+    palette_kind: PaletteKind,
 }
 
 impl Renderer {
@@ -64,7 +67,8 @@ impl Renderer {
             post: PostFx::new(device, gpu.scene_format()),
             scene: SceneState::new(),
             layout: KeyboardLayout::new(),
-            palette: Palette::default_palette(),
+            palette: Palette::new(PaletteKind::default()),
+            palette_kind: PaletteKind::default(),
             globals,
         }
     }
@@ -92,6 +96,10 @@ impl Renderer {
         let (width, height) = (gpu.config.width, gpu.config.height);
         self.post.resize(&gpu.device, width, height);
         let frame = Frame::new(width as f32, height as f32);
+        if input.visual.palette != self.palette_kind {
+            self.palette_kind = input.visual.palette;
+            self.palette = Palette::new(self.palette_kind);
+        }
 
         self.notes.clear();
         self.quads.clear();
@@ -106,7 +114,7 @@ impl Renderer {
                 dt: input.dt_s,
                 hit_y: frame.hit_y,
                 unit: frame.unit,
-                _pad: [0.0; 2],
+                flags: [f32::from(u8::from(input.visual.animated_background)), 0.0],
             },
         );
         self.notes.upload(&gpu.device, &gpu.queue);

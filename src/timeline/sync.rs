@@ -17,6 +17,7 @@ struct Sent {
     speed: f64,
     volume: f32,
     muted: Vec<bool>,
+    loop_range: Option<(f64, f64)>,
 }
 
 /// Transport ↔ audio synchronization state.
@@ -68,6 +69,8 @@ impl AudioSync {
             speed: f64::NAN,
             volume: f32::NAN,
             muted: Vec::new(),
+            // Never matches a real range, so the first update sends one.
+            loop_range: Some((f64::NAN, f64::NAN)),
         });
 
         if sent.song_id != song_id {
@@ -96,6 +99,10 @@ impl AudioSync {
         if sent.speed != transport.speed() {
             engine.send(AudioCmd::SetSpeed(transport.speed()));
             sent.speed = transport.speed();
+        }
+        if sent.loop_range != transport.active_loop() {
+            engine.send(AudioCmd::SetLoop(transport.active_loop()));
+            sent.loop_range = transport.active_loop();
         }
         if sent.volume != volume {
             engine.send(AudioCmd::SetVolume(volume));

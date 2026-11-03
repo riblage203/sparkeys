@@ -3,7 +3,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use crate::audio::{AudioCmd, AudioEngine, LoadedSoundFont, SoundFontLoader};
+use crate::audio::{AudioCmd, AudioEngine, LoadedSoundFont, RawMidi, SoundFontLoader, list_output_devices};
 use crate::config::AudioConfig;
 use crate::midi::Song;
 use crate::timeline::{AudioSync, Transport};
@@ -18,7 +18,12 @@ pub struct AudioState {
     font: Option<LoadedSoundFont>,
     loader: Option<SoundFontLoader>,
     retry_at: Option<Instant>,
+    output_device: Option<String>,
     buffer_frames: u32,
+    /// Output devices found at the last [`Self::refresh_devices`].
+    devices: Vec<String>,
+    /// Incremented each time an engine starts, so live inputs know to re-attach.
+    generation: u64,
 }
 
 impl AudioState {
@@ -31,7 +36,10 @@ impl AudioState {
             font: None,
             loader: None,
             retry_at: None,
+            output_device: config.output_device.clone(),
             buffer_frames: config.buffer_frames.clamp(32, 8192),
+            devices: Vec::new(),
+            generation: 0,
         };
         state.start_engine(Some(notices));
         if let Some(path) = &config.soundfont {
@@ -41,7 +49,7 @@ impl AudioState {
     }
 
     fn start_engine(&mut self, notices: Option<&mut Vec<String>>) {
-        match AudioEngine::start(self.buffer_frames) {
+        match AudioEngine::start(self.output_device.as_deref(), self.buffer_frames) {
             Ok(mut engine) => {
                 if let Some(font) = &self.font {
                     install_synth(&mut engine, font);
@@ -49,6 +57,7 @@ impl AudioState {
                 self.engine = Some(engine);
                 self.sync.reset();
                 self.retry_at = None;
+                self.generation += 1;
             }
             Err(err) => {
                 log::warn!("audio unavailable: {err:#}");
@@ -58,6 +67,29 @@ impl AudioState {
                 self.retry_at = Some(Instant::now() + RETRY_INTERVAL);
             }
         }
+    }
+
+    /// Switches output device and/or buffer size, restarting the stream if anything changed.
+    pub fn reconfigure(&mut self, output_device: Option<String>, buffer_frames: u32, notices: &mut Vec<String>) {
+        let buffer_frames = buffer_frames.clamp(32, 8192);
+        if output_device == self.output_device && buffer_frames == self.buffer_frames && self.engine.is_some() {
+            return;
+        }
+        self.output_device = output_device;
+        self.buffer_frames = buffer_frames;
+        // Drop the old stream first: some drivers allow only one open stream per device.
+        self.engine = None;
+        self.start_engine(Some(notices));
+    }
+
+    /// Re-reads the list of output devices.
+    pub fn refresh_devices(&mut self) {
+        self.devices = list_output_devices();
+    }
+
+    /// Output devices found at the last refresh.
+    pub fn devices(&self) -> &[String] {
+        &self.devices
     }
 
     /// Starts loading a SoundFont in the background; it replaces the current one when ready.
@@ -110,6 +142,24 @@ impl AudioState {
         self.sync.update(self.engine.as_mut(), transport, song, song_id, volume, dt_s);
     }
 
+    /// Changes whenever the audio engine is (re)started.
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+
+    /// Routes a live input queue straight into the audio callback.
+    /// Returns `false` (and drops the queue) when there is no audio device.
+    pub fn set_live_input(&mut self, queue: rtrb::Consumer<RawMidi>) -> bool {
+        self.engine.as_mut().is_some_and(|e| e.send(AudioCmd::SetLiveInput(queue)))
+    }
+
+    /// Releases all sounding notes and the pedal.
+    pub fn all_notes_off(&mut self) {
+        if let Some(engine) = &mut self.engine {
+            engine.send(AudioCmd::AllNotesOff);
+        }
+    }
+
     /// Visual minus audio time in ms, for the debug overlay.
     pub fn sync_error_ms(&self) -> Option<f64> {
         self.sync.sync_error_ms()
@@ -129,7 +179,8 @@ impl AudioState {
             Some(engine) => {
                 let info = engine.info();
                 let buffer = info.buffer_frames.map_or_else(|| "default buffer".to_owned(), |n| format!("{n} frames"));
-                format!("{font} · {} · {} Hz, {buffer}", info.device, info.sample_rate)
+                let latency_ms = engine.output_latency().as_secs_f64() * 1000.0;
+                format!("{font} · {} · {} Hz, {buffer}, out {latency_ms:.1} ms", info.device, info.sample_rate)
             }
             None => format!("{font} · no audio device"),
         }

@@ -10,16 +10,17 @@ use winit::application::ApplicationHandler;
 use winit::dpi::LogicalSize;
 use winit::event::{ElementState, KeyEvent, WindowEvent};
 use winit::event_loop::ActiveEventLoop;
-use winit::keyboard::{KeyCode, PhysicalKey};
+use winit::keyboard::{Key, KeyCode, ModifiersState, PhysicalKey};
 use winit::window::{Fullscreen, Window, WindowId};
 
 use crate::config::Config;
+use crate::live::{LiveInput, LiveState};
 
 use crate::midi::{self, Song};
-use crate::render::{Gpu, Renderer, SceneInput};
+use crate::render::{Gpu, LiveView, Renderer, SceneInput};
 use crate::timeline::Transport;
 use crate::ui::{EguiLayer, FALL_SECONDS_RANGE, OverlayState, draw_overlay};
-use audio::AudioState;
+pub use audio::AudioState;
 
 /// Arrow-key seek step.
 const SEEK_STEP_S: f64 = 5.0;
@@ -34,10 +35,13 @@ pub struct App {
     transport: Transport,
     song: Option<Song>,
     show_tracks: bool,
-    show_visual: bool,
+    show_settings: bool,
     /// Changes whenever a different song is loaded.
     song_id: u64,
     audio: AudioState,
+    live: LiveInput,
+    live_state: LiveState,
+    modifiers: ModifiersState,
     /// File given on the command line, opened once the window exists.
     initial_file: Option<PathBuf>,
     running: Option<Running>,
@@ -63,16 +67,22 @@ impl App {
             config.playback.fall_seconds.clamp(*FALL_SECONDS_RANGE.start(), *FALL_SECONDS_RANGE.end());
         config.audio.volume = config.audio.volume.clamp(0.0, 1.0);
         let mut notices: Vec<String> = warning.into_iter().collect();
-        let audio = AudioState::new(&config.audio, &mut notices);
+        let mut audio = AudioState::new(&config.audio, &mut notices);
+        let mut live = LiveInput::new(config.live.device.clone());
+        let mut live_state = LiveState::new();
+        live.set_enabled(config.live.enabled, &mut live_state, &mut audio);
         Self {
             transport: Transport::new(config.playback.speed),
             config,
             notices,
             song: None,
             show_tracks: false,
-            show_visual: false,
+            show_settings: false,
             song_id: 0,
             audio,
+            live,
+            live_state,
+            modifiers: ModifiersState::empty(),
             initial_file,
             running: None,
             fatal: None,
@@ -137,18 +147,46 @@ impl App {
         }
     }
 
+    /// Switches between song playback and live input.
+    fn set_live_mode(&mut self, enabled: bool) {
+        self.config.live.enabled = enabled;
+        if enabled && self.transport.is_playing() {
+            self.transport.toggle();
+        }
+        self.live.set_enabled(enabled, &mut self.live_state, &mut self.audio);
+    }
+
     fn handle_shortcut(&mut self, event: &KeyEvent) {
-        if event.state != ElementState::Pressed {
+        let PhysicalKey::Code(code) = event.physical_key else { return };
+        let pressed = event.state == ElementState::Pressed;
+        let live = self.config.live.enabled;
+        // The computer-keyboard input gets first pick (note keys, ←/→ octave).
+        if live && self.live.key_event(code, pressed, event.repeat, self.modifiers.shift_key()) {
             return;
         }
-        let PhysicalKey::Code(code) = event.physical_key else { return };
+        if !pressed {
+            return;
+        }
+        // Loop keys follow the typed letter, so they are right on any layout.
+        if !live
+            && !event.repeat
+            && let Key::Character(text) = &event.logical_key
+        {
+            match text.to_lowercase().as_str() {
+                "a" => return self.transport.set_loop_a(),
+                "b" => return self.transport.set_loop_b(),
+                "l" => return self.transport.toggle_loop(),
+                _ => {}
+            }
+        }
         match code {
-            KeyCode::ArrowLeft => self.transport.seek(self.transport.position() - SEEK_STEP_S),
-            KeyCode::ArrowRight => self.transport.seek(self.transport.position() + SEEK_STEP_S),
+            KeyCode::ArrowLeft if !live => self.transport.seek(self.transport.position() - SEEK_STEP_S),
+            KeyCode::ArrowRight if !live => self.transport.seek(self.transport.position() + SEEK_STEP_S),
             _ if event.repeat => {}
-            KeyCode::Space if self.song.is_some() => self.transport.toggle(),
-            KeyCode::Home => self.transport.seek(self.transport.start()),
-            KeyCode::KeyH => self.config.ui.visible = !self.config.ui.visible,
+            KeyCode::Space if !live && self.song.is_some() => self.transport.toggle(),
+            KeyCode::Home if !live => self.transport.seek(self.transport.start()),
+            // F1 too, because H is a note key when typing notes in live mode.
+            KeyCode::KeyH | KeyCode::F1 => self.config.ui.visible = !self.config.ui.visible,
             KeyCode::F3 => self.config.ui.show_fps = !self.config.ui.show_fps,
             KeyCode::F11 => {
                 if let Some(running) = &self.running {
@@ -189,6 +227,10 @@ impl App {
             self.config.audio.volume,
             dt,
         );
+        if self.config.live.enabled {
+            self.live.update(&mut self.live_state, &mut self.audio, &mut self.notices);
+            self.live_state.prune(self.config.playback.fall_seconds + 1.0);
+        }
 
         let frame = match running.gpu.surface.get_current_texture() {
             wgpu::CurrentSurfaceTexture::Success(frame) => frame,
@@ -200,8 +242,15 @@ impl App {
                 running.window.request_redraw();
                 return;
             }
-            wgpu::CurrentSurfaceTexture::Outdated | wgpu::CurrentSurfaceTexture::Lost => {
+            wgpu::CurrentSurfaceTexture::Outdated => {
                 running.gpu.reconfigure();
+                running.window.request_redraw();
+                return;
+            }
+            wgpu::CurrentSurfaceTexture::Lost => {
+                if let Err(err) = running.gpu.recreate_surface() {
+                    log::error!("{err:#}");
+                }
                 running.window.request_redraw();
                 return;
             }
@@ -218,15 +267,29 @@ impl App {
         let mut encoder =
             running.gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some("frame") });
 
+        let live_mode = self.config.live.enabled;
         let scene = SceneInput {
-            song: self.song.as_ref(),
+            song: if live_mode { None } else { self.song.as_ref() },
             time_s: self.transport.position(),
             fall_seconds: self.config.playback.fall_seconds,
             dt_s: dt as f32,
             visual: &self.config.visual,
+            live: live_mode.then(|| LiveView {
+                notes: self.live_state.notes(),
+                hits: self.live_state.hits(),
+                time_s: self.live_state.now_s(),
+                pedal: self.live_state.pedal_down(),
+            }),
+            split_key: self.config.live.split_key,
         };
         let time = running.start.elapsed().as_secs_f32();
         running.renderer.render(&running.gpu, &mut encoder, &scene_view, time, &scene);
+        self.live_state.clear_hits();
+        let mut live_choice = live_mode;
+        let mut midi_choice = self.live.wanted().map(str::to_owned);
+        let mut audio_device = self.config.audio.output_device.clone();
+        let mut buffer_frames = self.config.audio.buffer_frames;
+        let settings_were_open = self.show_settings;
 
         let renderer = &running.renderer;
         let track_color = |track: u16| renderer.track_color(track);
@@ -242,13 +305,23 @@ impl App {
             song: self.song.as_mut(),
             fall_seconds: &mut self.config.playback.fall_seconds,
             show_tracks: &mut self.show_tracks,
-            show_visual: &mut self.show_visual,
+            show_settings: &mut self.show_settings,
             visual: &mut self.config.visual,
+            display: &mut self.config.display,
+            split_key: &mut self.config.live.split_key,
+            audio_devices: self.audio.devices(),
+            audio_device: &mut audio_device,
+            buffer_frames: &mut buffer_frames,
             notes_drawn: running.renderer.notes_drawn(),
             track_color: &track_color,
             volume: &mut self.config.audio.volume,
             audio_status: &audio_status,
             sync_error_ms: self.audio.sync_error_ms(),
+            live_mode: &mut live_choice,
+            midi_choices: self.live.choices(),
+            midi_choice: &mut midi_choice,
+            midi_status: self.live.status(),
+            midi_connected: self.live.is_connected(),
             open_requested: false,
             soundfont_requested: false,
         };
@@ -260,7 +333,34 @@ impl App {
         running.gpu.queue.submit(extra.into_iter().chain(std::iter::once(encoder.finish())));
         running.window.pre_present_notify();
         running.gpu.queue.present(frame);
+        if self.config.display.limit_fps {
+            let fps = match self.config.display.max_fps {
+                0 => running
+                    .window
+                    .current_monitor()
+                    .and_then(|m| m.refresh_rate_millihertz())
+                    .map_or(60, |mhz| mhz / 1000),
+                n => n,
+            };
+            pace_frame(running.stats.frame_start(), fps);
+        }
         running.window.request_redraw();
+
+        if self.show_settings && !settings_were_open {
+            self.audio.refresh_devices();
+        }
+        if audio_device != self.config.audio.output_device || buffer_frames != self.config.audio.buffer_frames {
+            self.config.audio.output_device = audio_device.clone();
+            self.config.audio.buffer_frames = buffer_frames;
+            self.audio.reconfigure(audio_device, buffer_frames, &mut self.notices);
+        }
+        if live_choice != live_mode {
+            self.set_live_mode(live_choice);
+        }
+        if midi_choice.as_deref() != self.live.wanted() {
+            self.live.select(midi_choice, &mut self.live_state, &mut self.audio);
+        }
+        self.config.live.device = self.live.wanted().map(str::to_owned);
 
         if open_requested {
             self.pick_file();
@@ -314,11 +414,32 @@ impl ApplicationHandler for App {
                     running.gpu.resize(size.width, size.height);
                 }
             }
-            WindowEvent::DroppedFile(path) => self.open_file(&path),
+            WindowEvent::DroppedFile(path) => {
+                if self.config.live.enabled {
+                    self.set_live_mode(false);
+                }
+                self.open_file(&path);
+            }
+            WindowEvent::ModifiersChanged(modifiers) => self.modifiers = modifiers.state(),
+            WindowEvent::Focused(false) => self.live.release_keys(),
             WindowEvent::KeyboardInput { event, .. } if !consumed => self.handle_shortcut(&event),
             WindowEvent::RedrawRequested => self.redraw(),
             _ => {}
         }
+    }
+}
+
+/// Sleeps until `fps` would allow the next frame, measured from `frame_start`.
+/// Sleeps coarsely, then spins the last millisecond for an even cadence.
+fn pace_frame(frame_start: Instant, fps: u32) {
+    let budget = std::time::Duration::from_secs_f64(1.0 / f64::from(fps.clamp(10, 1000)));
+    let deadline = frame_start + budget;
+    let coarse = deadline.saturating_duration_since(Instant::now()).saturating_sub(std::time::Duration::from_millis(1));
+    if !coarse.is_zero() {
+        std::thread::sleep(coarse);
+    }
+    while Instant::now() < deadline {
+        std::hint::spin_loop();
     }
 }
 
@@ -340,6 +461,11 @@ impl FrameStats {
         self.last = now;
         self.avg_dt += (dt as f32 - self.avg_dt) * 0.05;
         dt
+    }
+
+    /// When the current frame started (last [`Self::tick`]).
+    fn frame_start(&self) -> Instant {
+        self.last
     }
 
     fn fps(&self) -> f32 {

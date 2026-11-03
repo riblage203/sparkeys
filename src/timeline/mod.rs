@@ -15,6 +15,8 @@ pub const LEAD_IN_S: f64 = 2.0;
 pub const MIN_SPEED: f64 = 0.25;
 /// Fastest allowed playback speed.
 pub const MAX_SPEED: f64 = 2.0;
+/// Shortest loop accepted (seconds); shorter A–B ranges are ignored.
+pub const MIN_LOOP_S: f64 = 0.5;
 
 /// The playback position and state of the loaded song.
 #[derive(Debug, Clone)]
@@ -26,6 +28,9 @@ pub struct Transport {
     /// Incremented on every jump (seek, load, restart) so the audio thread's
     /// reports can be matched to the request they follow.
     seek_serial: u64,
+    loop_a: Option<f64>,
+    loop_b: Option<f64>,
+    loop_enabled: bool,
 }
 
 impl Transport {
@@ -37,6 +42,9 @@ impl Transport {
             speed: speed.clamp(MIN_SPEED, MAX_SPEED),
             duration_s: 0.0,
             seek_serial: 0,
+            loop_a: None,
+            loop_b: None,
+            loop_enabled: false,
         }
     }
 
@@ -46,6 +54,49 @@ impl Transport {
         self.position_s = -LEAD_IN_S;
         self.playing = false;
         self.seek_serial += 1;
+        self.clear_loop();
+    }
+
+    /// Sets loop start at the current position (B is dropped if it is now before A).
+    pub fn set_loop_a(&mut self) {
+        let a = self.position_s.max(0.0);
+        self.loop_a = Some(a);
+        if self.loop_b.is_some_and(|b| b - a < MIN_LOOP_S) {
+            self.loop_b = None;
+        }
+    }
+
+    /// Sets loop end at the current position and turns looping on.
+    pub fn set_loop_b(&mut self) {
+        let b = self.position_s;
+        let a = self.loop_a.unwrap_or(0.0);
+        if b - a >= MIN_LOOP_S {
+            self.loop_a = Some(a);
+            self.loop_b = Some(b);
+            self.loop_enabled = true;
+        }
+    }
+
+    /// Turns looping on/off (keeps the A–B points).
+    pub fn toggle_loop(&mut self) {
+        self.loop_enabled = !self.loop_enabled && self.loop_points().is_some();
+    }
+
+    /// Forgets the loop.
+    pub fn clear_loop(&mut self) {
+        self.loop_a = None;
+        self.loop_b = None;
+        self.loop_enabled = false;
+    }
+
+    /// A and B as set (whether or not looping is on).
+    pub fn loop_points(&self) -> Option<(f64, f64)> {
+        Some((self.loop_a?, self.loop_b?))
+    }
+
+    /// The A–B range when looping is on.
+    pub fn active_loop(&self) -> Option<(f64, f64)> {
+        self.loop_points().filter(|_| self.loop_enabled)
     }
 
     /// Current song time in seconds (negative during the lead-in).
@@ -117,7 +168,14 @@ impl Transport {
         if !self.playing {
             return;
         }
+        let before = self.position_s;
         self.position_s += dt_s * self.speed;
+        if let Some((a, b)) = self.active_loop()
+            && before <= b
+            && self.position_s >= b
+        {
+            self.position_s = a + (self.position_s - b);
+        }
         if self.position_s >= self.duration_s {
             self.position_s = self.duration_s;
             self.playing = false;
@@ -168,6 +226,26 @@ mod tests {
         t.toggle(); // restart from the end is a jump
         assert_eq!(t.seek_serial(), s0 + 3);
         assert_eq!(t.position(), -LEAD_IN_S);
+    }
+
+    #[test]
+    fn loop_points_and_wall_clock_wrap() {
+        let mut t = Transport::new(1.0);
+        t.load(10.0);
+        t.seek(2.0);
+        t.set_loop_a();
+        t.seek(2.2);
+        t.set_loop_b(); // too short: ignored
+        assert_eq!(t.active_loop(), None);
+        t.seek(4.0);
+        t.set_loop_b();
+        assert_eq!(t.active_loop(), Some((2.0, 4.0)));
+        t.toggle();
+        t.advance(0.5);
+        assert!((t.position() - 2.5).abs() < 1e-9);
+        t.toggle_loop();
+        assert_eq!(t.active_loop(), None);
+        assert_eq!(t.loop_points(), Some((2.0, 4.0)));
     }
 
     #[test]
