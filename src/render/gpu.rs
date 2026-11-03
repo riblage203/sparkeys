@@ -17,6 +17,9 @@ pub struct Gpu {
     pub config: wgpu::SurfaceConfiguration,
     /// Adapter description shown in the UI.
     pub adapter_info: wgpu::AdapterInfo,
+    // Kept to recreate the surface if the OS invalidates it.
+    instance: wgpu::Instance,
+    window: Arc<Window>,
 }
 
 impl Gpu {
@@ -70,7 +73,7 @@ impl Gpu {
         };
         surface.configure(&device, &config);
 
-        Ok(Self { surface, device, queue, config, adapter_info })
+        Ok(Self { surface, device, queue, config, adapter_info, instance, window })
     }
 
     /// Format for scene passes: the sRGB view of the swapchain (linear shader output).
@@ -91,6 +94,13 @@ impl Gpu {
         self.config.width = width;
         self.config.height = height;
         self.reconfigure();
+    }
+
+    /// Builds a new surface for the window after the old one was lost.
+    pub fn recreate_surface(&mut self) -> anyhow::Result<()> {
+        self.surface = self.instance.create_surface(self.window.clone()).context("recreating window surface")?;
+        self.reconfigure();
+        Ok(())
     }
 
     /// Re-applies the current configuration, e.g. after the surface became outdated.

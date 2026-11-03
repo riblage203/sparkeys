@@ -18,8 +18,8 @@ pub struct Globals {
     pub hit_y: f32,
     /// Width of a white key in pixels (resolution-independent sizing).
     pub unit: f32,
-    /// Padding to 16-byte multiples.
-    pub _pad: [f32; 2],
+    /// x: background animation on (1) / off (0); y unused (pads to 16 bytes).
+    pub flags: [f32; 2],
 }
 
 /// The uniform buffer and its bind group.

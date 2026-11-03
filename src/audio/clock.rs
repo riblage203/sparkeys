@@ -39,6 +39,8 @@ pub struct SharedClock {
     seq: AtomicU64,
     position_bits: AtomicU64,
     heard_at_ns: AtomicU64,
+    /// Output latency of the last buffer, outside the seqlock (read on its own).
+    latency_ns: AtomicU64,
     speed_bits: AtomicU64,
     /// bit 0: playing, bit 1: ended, bits 2..: seek serial.
     flags: AtomicU64,
@@ -52,9 +54,21 @@ impl SharedClock {
             seq: AtomicU64::new(0),
             position_bits: AtomicU64::new(0f64.to_bits()),
             heard_at_ns: AtomicU64::new(0),
+            latency_ns: AtomicU64::new(0),
             speed_bits: AtomicU64::new(1f64.to_bits()),
             flags: AtomicU64::new(0),
         }
+    }
+
+    /// Records the output latency (callback → speakers) of the last buffer.
+    pub fn set_latency(&self, latency: Duration) {
+        // Saturates for absurd values; latency is milliseconds in practice.
+        self.latency_ns.store(u64::try_from(latency.as_nanos()).unwrap_or(u64::MAX), Ordering::Relaxed);
+    }
+
+    /// Output latency reported for the last buffer.
+    pub fn latency(&self) -> Duration {
+        Duration::from_nanos(self.latency_ns.load(Ordering::Relaxed))
     }
 
     /// Reference instant for [`ClockSnapshot::heard_at`].

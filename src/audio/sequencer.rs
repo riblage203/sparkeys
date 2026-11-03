@@ -52,8 +52,23 @@ impl Synth for Silence {
     fn reset(&mut self) {}
 }
 
+/// A raw channel message from a live input (status byte includes the channel).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawMidi {
+    /// Full status byte, 0x80..=0xEF.
+    pub status: u8,
+    /// First data byte.
+    pub data1: u8,
+    /// Second data byte (0 if unused).
+    pub data2: u8,
+}
+
 /// Commands from the main thread to the audio thread.
 pub enum AudioCmd {
+    /// Attach the queue a live MIDI input writes into (replaces any previous one).
+    SetLiveInput(rtrb::Consumer<RawMidi>),
+    /// Release every sounding note and lift the pedal (live device lost or mode change).
+    AllNotesOff,
     /// Replace the song. Followed by a `Seek` from the main thread.
     LoadSong {
         /// All channel events, sorted by time.
@@ -78,6 +93,8 @@ pub enum AudioCmd {
     },
     /// Playback speed multiplier.
     SetSpeed(f64),
+    /// Loop between two song times (`None` = no loop).
+    SetLoop(Option<(f64, f64)>),
     /// Output gain, 0..=1.
     SetVolume(f32),
     /// Mute or unmute one part.
@@ -98,6 +115,8 @@ pub enum Garbage {
     Muted(Vec<bool>),
     /// A replaced synthesizer.
     Synth(Box<rustysynth::Synthesizer>),
+    /// A replaced live input queue.
+    LiveInput(rtrb::Consumer<RawMidi>),
 }
 
 /// Playback cursor over a song's events.
@@ -111,6 +130,7 @@ pub struct Sequencer {
     ended: bool,
     speed: f64,
     seek_serial: u64,
+    loop_range: Option<(f64, f64)>,
 }
 
 impl Sequencer {
@@ -126,6 +146,7 @@ impl Sequencer {
             ended: false,
             speed: 1.0,
             seek_serial: 0,
+            loop_range: None,
         }
     }
 
@@ -183,12 +204,19 @@ impl Sequencer {
             }
             AudioCmd::Seek { time_s, serial } => self.seek(time_s, serial, synth),
             AudioCmd::SetSpeed(speed) => self.speed = speed,
+            AudioCmd::SetLoop(range) => self.loop_range = range.filter(|(a, b)| b > a),
             AudioCmd::SetMute { part, muted } => {
                 if let Some(slot) = self.muted.get_mut(usize::from(part)) {
                     *slot = muted;
                 }
             }
-            AudioCmd::SetSynth(_) | AudioCmd::SetVolume(_) => {}
+            AudioCmd::AllNotesOff => {
+                for channel in 0..16 {
+                    synth.midi(channel, 0xB0, 64, 0);
+                }
+                synth.all_notes_off(false);
+            }
+            AudioCmd::SetSynth(_) | AudioCmd::SetVolume(_) | AudioCmd::SetLiveInput(_) => {}
         }
     }
 
@@ -244,7 +272,16 @@ impl Sequencer {
         while offset < len {
             let n = SUB_BLOCK.min(len - offset);
             if self.playing {
-                let end = self.position_s + n as f64 / sample_rate * self.speed;
+                let mut end = self.position_s + n as f64 / sample_rate * self.speed;
+                // Crossing the loop end: play up to B, then continue from A.
+                if let Some((a, b)) = self.loop_range
+                    && self.position_s <= b
+                    && end >= b
+                {
+                    self.dispatch_before(b, synth);
+                    self.wrap_to(a, synth);
+                    end = a + (end - b);
+                }
                 self.dispatch_before(end, synth);
                 self.position_s = end;
                 if end >= self.duration_s {
@@ -257,6 +294,17 @@ impl Sequencer {
             synth.render(&mut left[offset..offset + n], &mut right[offset..offset + n]);
             offset += n;
         }
+    }
+
+    /// Loop jump: release what is sounding (with natural tails) and continue at `time_s`.
+    fn wrap_to(&mut self, time_s: f64, synth: &mut dyn Synth) {
+        for channel in 0..16 {
+            synth.midi(channel, 0xB0, 64, 0);
+        }
+        synth.all_notes_off(false);
+        self.position_s = time_s;
+        self.cursor = self.events.partition_point(|e| e.time_s < time_s);
+        self.restore_pedals(synth);
     }
 
     fn dispatch_before(&mut self, end_s: f64, synth: &mut dyn Synth) {
@@ -344,6 +392,22 @@ mod tests {
             let error = (frame as f64 - ideal).abs();
             assert!(error <= SUB_BLOCK as f64, "speed {speed}: frame {frame} vs {ideal}");
         }
+    }
+
+    #[test]
+    fn loop_replays_the_section_and_never_ends() {
+        let events = vec![ev(0.5, 0, 0, 0x90, 60, 100), ev(1.5, 0, 0, 0x90, 62, 100)];
+        let mut synth = Recorder::default();
+        let mut seq = loaded(events, 1, 3.0, &mut synth);
+        seq.apply(AudioCmd::SetLoop(Some((0.25, 1.0))), &mut synth, &mut |_| {});
+        seq.apply(AudioCmd::Play, &mut synth, &mut |_| {});
+        run(&mut seq, &mut synth, (4.0 * SR) as usize);
+
+        let note_ons: Vec<u8> = synth.log.iter().filter(|m| m.2 == 0x90).map(|m| m.3).collect();
+        // 4 s of a 0.75 s loop starting at 0: the note at 0.5 s plays 5 times, the one past B never.
+        assert_eq!(note_ons, vec![60; 5]);
+        assert!(seq.is_playing() && !seq.has_ended());
+        assert!((0.25..1.0).contains(&seq.position()));
     }
 
     #[test]

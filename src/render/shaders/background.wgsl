@@ -7,7 +7,8 @@ struct Globals {
     dt: f32,
     hit_y: f32,
     unit: f32,
-    _pad: vec2<f32>,
+    // x: animation on (1) / off (0).
+    flags: vec2<f32>,
 };
 
 @group(0) @binding(0) var<uniform> globals: Globals;
@@ -52,7 +53,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
     var col = mix(top, bottom, smoothstep(0.0, hit_v, in.uv.y));
 
     // Smoke: two octaves of slowly rising value noise, strongest near the keys.
-    let t = globals.time;
+    let t = globals.time * globals.flags.x;
     let p = vec2<f32>(in.uv.x * aspect, in.uv.y) * 3.0;
     let smoke = value_noise(p + vec2<f32>(t * 0.02, t * 0.06)) * 0.65
         + value_noise(p * 2.3 - vec2<f32>(t * 0.03, t * 0.11)) * 0.35;
@@ -61,7 +62,7 @@ fn fs_main(in: VsOut) -> @location(0) vec4<f32> {
 
     // Warm haze just above the hit line, breathing slowly.
     let h = vec2<f32>((in.uv.x - 0.5) * aspect * 0.55, (in.uv.y - hit_v) * 2.2);
-    let breathe = 0.5 + 0.5 * sin(t * 0.4);
+    let breathe = 0.5 + 0.5 * sin(t * 0.4 + 1.2);
     col += vec3<f32>(1.0, 0.40, 0.12) * exp(-dot(h, h) * 3.0) * (0.018 + 0.007 * breathe);
 
     let d = (in.uv - 0.5) * vec2<f32>(aspect, 1.0);

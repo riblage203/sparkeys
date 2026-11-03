@@ -1,7 +1,10 @@
 //! Per-frame scene building: note bars, keyboard, hit line, particle emission
 //! and the small animations (key press depth, hit pulse) that tie them together.
 
-use crate::config::VisualConfig;
+use std::collections::VecDeque;
+
+use crate::config::{ColorMode, VisualConfig};
+use crate::live::{LiveHit, LiveNote};
 use crate::midi::{Note, Song};
 
 use super::layout::{BLACK_LENGTH, FIRST_KEY, KEY_COUNT, KeyGeom, KeyboardLayout, WHITE_KEY_COUNT};
@@ -24,6 +27,33 @@ pub struct SceneInput<'a> {
     pub dt_s: f32,
     /// User visual settings.
     pub visual: &'a VisualConfig,
+    /// Live mode: draw what is being played instead of the song.
+    pub live: Option<LiveView<'a>>,
+    /// Keys below this are the left hand (hand coloring, live mode).
+    pub split_key: u8,
+}
+
+impl SceneInput<'_> {
+    /// Palette index for a note: its part, or its hand (always by hand in live mode).
+    fn color_index(&self, track: u16, pitch: u8) -> u16 {
+        if self.live.is_some() || self.visual.color_mode == ColorMode::Hand {
+            u16::from(pitch < self.split_key)
+        } else {
+            track
+        }
+    }
+}
+
+/// Live-mode notes for one frame.
+pub struct LiveView<'a> {
+    /// Played notes, oldest first.
+    pub notes: &'a VecDeque<LiveNote>,
+    /// Note-ons received since the previous frame.
+    pub hits: &'a [LiveHit],
+    /// Current live time (same clock as the notes).
+    pub time_s: f64,
+    /// Sustain pedal state.
+    pub pedal: bool,
 }
 
 /// Screen-space placement of the keyboard, in physical pixels.
@@ -102,7 +132,15 @@ impl SceneState {
         let dt = input.dt_s.max(0.0);
         let mut held: [Held; KEY_COUNT] = [None; KEY_COUNT];
 
-        if let Some(song) = input.song {
+        if let Some(live) = &input.live {
+            draw_live_notes(out.notes, layout, palette, live, input, frame, &mut held);
+            for hit in live.hits {
+                if let Some(key) = layout.key(hit.pitch) {
+                    let color = palette.color(input.color_index(0, hit.pitch));
+                    self.burst(out.particles, key, hit.velocity, color, frame, input.visual.particles);
+                }
+            }
+        } else if let Some(song) = input.song {
             draw_notes(out.notes, layout, palette, song, input, frame, &mut held);
             let step = input.time_s - self.last_time_s;
             if step > 0.0 && step < MAX_CONTINUOUS_STEP_S {
@@ -118,8 +156,13 @@ impl SceneState {
         if input.visual.show_hit_line {
             draw_hit_line(out.quads, frame, self.pulse);
         }
-        if let Some(song) = input.song {
-            draw_pedal(out.quads, frame, song.pedal_down_at(input.time_s));
+        let pedal = match (&input.live, input.song) {
+            (Some(live), _) => Some(live.pedal),
+            (None, Some(song)) => Some(song.pedal_down_at(input.time_s)),
+            (None, None) => None,
+        };
+        if let Some(down) = pedal {
+            draw_pedal(out.quads, frame, down);
         }
     }
 
@@ -140,15 +183,34 @@ impl SceneState {
                 continue;
             }
             let Some(key) = layout.key(note.pitch) else { continue };
-            let v = f32::from(note.velocity) / 127.0;
-            self.pulse += 0.12 + 0.3 * v;
-            let count = ((10.0 + 70.0 * v.powf(1.5)) * amount).round() as usize;
-            let (x, w) = note_lane(key, frame);
-            let color = palette.color(note.track);
-            for _ in 0..count {
-                let p = self.spark(x, w, frame, color, v, 1.0);
-                particles.emit(p);
-            }
+            self.burst(
+                particles,
+                key,
+                note.velocity,
+                palette.color(input.color_index(note.track, note.pitch)),
+                frame,
+                amount,
+            );
+        }
+    }
+
+    /// One note-on: hit-line pulse plus a spray of embers scaled by velocity.
+    fn burst(
+        &mut self,
+        particles: &mut Particles,
+        key: KeyGeom,
+        velocity: u8,
+        color: [f32; 3],
+        frame: &Frame,
+        amount: f32,
+    ) {
+        let v = f32::from(velocity) / 127.0;
+        self.pulse += 0.12 + 0.3 * v;
+        let count = ((10.0 + 70.0 * v.powf(1.5)) * amount.max(0.0)).round() as usize;
+        let (x, w) = note_lane(key, frame);
+        for _ in 0..count {
+            let p = self.spark(x, w, frame, color, v, 1.0);
+            particles.emit(p);
         }
     }
 
@@ -234,7 +296,7 @@ fn draw_notes(
             if key.black != black_pass || note.end_s < t || !part_visible(song, note) {
                 continue;
             }
-            let base = palette.color(note.track);
+            let base = palette.color(input.color_index(note.track, note.pitch));
             let v = f32::from(note.velocity) / 127.0;
             let active = note.start_s <= t && t < note.end_s;
             if active {
@@ -261,6 +323,58 @@ fn draw_notes(
             );
         }
     }
+}
+
+/// Live notes grow upward from the hit line while held, then scroll away.
+fn draw_live_notes(
+    batch: &mut Batch,
+    layout: &KeyboardLayout,
+    palette: &Palette,
+    live: &LiveView<'_>,
+    input: &SceneInput<'_>,
+    frame: &Frame,
+    held: &mut [Held; KEY_COUNT],
+) {
+    let t = live.time_s;
+    let px_per_s = f64::from(frame.hit_y) / input.fall_seconds.max(0.1);
+    for black_pass in [false, true] {
+        for note in live.notes {
+            let Some(key) = layout.key(note.pitch) else { continue };
+            if key.black != black_pass {
+                continue;
+            }
+            let Some((top, bottom)) = live_bar(note, t, px_per_s, frame.hit_y) else { continue };
+            let base = palette.color(input.color_index(0, note.pitch));
+            let v = f32::from(note.velocity) / 127.0;
+            let active = note.end_s.is_none();
+            if active {
+                let slot = &mut held[usize::from(note.pitch - FIRST_KEY)];
+                if slot.is_none_or(|(_, _, start)| note.start_s >= start) {
+                    *slot = Some((base, v, note.start_s));
+                }
+            }
+            let (x, w) = note_lane(key, frame);
+            let flash = if active { (1.0 - (t - note.start_s) as f32 / 0.08).max(0.0) } else { 0.0 };
+            batch.push(
+                [x, top, w, bottom - top],
+                [base[0], base[1], base[2], 0.55 + 0.45 * v],
+                [input.visual.corner_radius, f32::from(u8::from(active)), flash, 0.0],
+            );
+        }
+    }
+}
+
+/// Vertical extent (top, bottom) in pixels of a live note at time `t`, or
+/// `None` once it has scrolled off the top. Held notes keep their bottom on
+/// the hit line and grow upward.
+fn live_bar(note: &LiveNote, t: f64, px_per_s: f64, hit_y: f32) -> Option<(f32, f32)> {
+    let end = note.end_s.unwrap_or(t).min(t);
+    let bottom = (f64::from(hit_y) - (t - end) * px_per_s) as f32;
+    let top = (f64::from(hit_y) - (t - note.start_s) * px_per_s) as f32;
+    if bottom <= 0.0 {
+        return None;
+    }
+    Some((top.min(bottom - 3.0), bottom))
 }
 
 fn draw_keyboard(
@@ -364,6 +478,20 @@ mod tests {
             let x = r.next();
             assert!((0.0..1.0).contains(&x));
         }
+    }
+
+    #[test]
+    fn live_bars_grow_while_held_then_rise() {
+        let held = LiveNote { pitch: 60, velocity: 100, start_s: 1.0, end_s: None };
+        // Held for 0.5 s at 100 px/s: bottom on the hit line, 50 px tall.
+        assert_eq!(live_bar(&held, 1.5, 100.0, 800.0), Some((750.0, 800.0)));
+        // Released at 1.5 s, now 2.0 s: the whole bar moved up 50 px.
+        let released = LiveNote { end_s: Some(1.5), ..held };
+        assert_eq!(live_bar(&released, 2.0, 100.0, 800.0), Some((700.0, 750.0)));
+        // Gone once the bottom passes the top of the screen.
+        assert_eq!(live_bar(&released, 10.0, 100.0, 800.0), None);
+        // A just-pressed note still has a visible minimum height.
+        assert_eq!(live_bar(&held, 1.0, 100.0, 800.0), Some((797.0, 800.0)));
     }
 
     #[test]

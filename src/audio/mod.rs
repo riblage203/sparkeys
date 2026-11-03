@@ -9,7 +9,7 @@ mod sequencer;
 mod soundfont;
 
 pub use clock::{ClockSnapshot, SharedClock};
-pub use sequencer::AudioCmd;
+pub use sequencer::{AudioCmd, RawMidi};
 pub use soundfont::{LoadedSoundFont, SoundFontLoader};
 
 use std::sync::Arc;
@@ -20,7 +20,7 @@ use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use cpal::{FromSample, OutputCallbackInfo, SizedSample};
 use rtrb::{Consumer, Producer, RingBuffer};
 
-use sequencer::{Garbage, Sequencer, Silence};
+use sequencer::{Garbage, Sequencer, Silence, Synth as _};
 
 /// Command queue depth; the main thread sends a handful per frame at most.
 const COMMAND_CAPACITY: usize = 256;
@@ -52,12 +52,23 @@ pub struct AudioEngine {
 }
 
 impl AudioEngine {
-    /// Opens the default output device, asking for `buffer_frames` per
-    /// callback (falls back to the device default if refused).
-    pub fn start(buffer_frames: u32) -> anyhow::Result<Self> {
+    /// Opens the output device named `device_name` (the system default if
+    /// `None` or not found), asking for `buffer_frames` per callback (falls
+    /// back to the device default if refused).
+    pub fn start(device_name: Option<&str>, buffer_frames: u32) -> anyhow::Result<Self> {
         let host = cpal::default_host();
-        let device = host.default_output_device().context("no audio output device found")?;
-        let name = device.description().map(|d| d.name().to_owned()).unwrap_or_else(|_| "unknown device".into());
+        let named = device_name.and_then(|wanted| {
+            let found = host.output_devices().ok()?.find(|d| device_label(d) == wanted);
+            if found.is_none() {
+                log::warn!("output device \"{wanted}\" not found; using the default");
+            }
+            found
+        });
+        let device = match named {
+            Some(device) => device,
+            None => host.default_output_device().context("no audio output device found")?,
+        };
+        let name = device_label(&device);
         let supported = device.default_output_config().context("querying the output format")?;
 
         let fixed = match *supported.buffer_size() {
@@ -90,6 +101,7 @@ impl AudioEngine {
             sequencer: Sequencer::new(),
             synth: None,
             commands: command_rx,
+            live: None,
             garbage: garbage_tx,
             clock: clock.clone(),
             left: vec![0.0; MAX_CHUNK],
@@ -141,10 +153,30 @@ impl AudioEngine {
         self.failed.load(Ordering::Relaxed)
     }
 
+    /// Output latency reported by the device for the last buffer.
+    pub fn output_latency(&self) -> std::time::Duration {
+        self.clock.latency()
+    }
+
     /// Stream description.
     pub fn info(&self) -> &AudioInfo {
         &self.info
     }
+}
+
+/// Names of the available output devices.
+pub fn list_output_devices() -> Vec<String> {
+    match cpal::default_host().output_devices() {
+        Ok(devices) => devices.map(|d| device_label(&d)).collect(),
+        Err(err) => {
+            log::warn!("listing output devices failed: {err}");
+            Vec::new()
+        }
+    }
+}
+
+fn device_label(device: &cpal::Device) -> String {
+    device.description().map(|d| d.name().to_owned()).unwrap_or_else(|_| "unknown device".into())
 }
 
 fn build<T>(
@@ -174,6 +206,8 @@ struct CallbackState {
     sequencer: Sequencer,
     synth: Option<Box<rustysynth::Synthesizer>>,
     commands: Consumer<AudioCmd>,
+    /// Live MIDI input, played immediately at the start of each buffer.
+    live: Option<Consumer<RawMidi>>,
     garbage: Producer<Garbage>,
     clock: Arc<SharedClock>,
     left: Vec<f32>,
@@ -185,7 +219,8 @@ struct CallbackState {
 
 impl CallbackState {
     fn process<T: SizedSample + FromSample<f32>>(&mut self, out: &mut [T], channels: usize, info: &OutputCallbackInfo) {
-        let Self { sequencer, synth, commands, garbage, clock, left, right, sample_rate, gain, target_gain } = self;
+        let Self { sequencer, synth, commands, live, garbage, clock, left, right, sample_rate, gain, target_gain } =
+            self;
         let mut trash = |item: Garbage| {
             // The main thread drains this queue every frame, so it is never
             // full in practice; if it were, the item would be freed here.
@@ -203,6 +238,11 @@ impl CallbackState {
                     }
                 }
                 AudioCmd::SetVolume(v) => *target_gain = v.clamp(0.0, 1.0),
+                AudioCmd::SetLiveInput(queue) => {
+                    if let Some(old) = live.replace(queue) {
+                        trash(Garbage::LiveInput(old));
+                    }
+                }
                 other => match synth.as_deref_mut() {
                     Some(s) => sequencer.apply(other, s, &mut trash),
                     None => sequencer.apply(other, &mut Silence, &mut trash),
@@ -210,8 +250,19 @@ impl CallbackState {
             }
         }
 
+        // Live notes go straight to the synth: latency is one buffer plus the output latency.
+        if let (Some(queue), Some(s)) = (live.as_mut(), synth.as_deref_mut()) {
+            while let Ok(m) = queue.pop() {
+                s.midi(m.status & 0x0F, m.status & 0xF0, m.data1, m.data2);
+            }
+        } else if let Some(queue) = live.as_mut() {
+            // No SoundFont yet: drop live input so it doesn't pile up.
+            while queue.pop().is_ok() {}
+        }
+
         let ts = info.timestamp();
         let latency = ts.playback.saturating_duration_since(ts.callback);
+        clock.set_latency(latency);
         clock.publish(&ClockSnapshot {
             position_s: sequencer.position(),
             heard_at: clock.epoch().elapsed() + latency,
